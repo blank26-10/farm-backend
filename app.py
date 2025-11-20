@@ -32,6 +32,13 @@ LOCAL_WEIGHT = os.path.join(HERE, "best.pt")
 MODEL_PATH = LOCAL_WEIGHT if os.path.exists(LOCAL_WEIGHT) else DEFAULT_WEIGHT
 print(f"Loading model from: {MODEL_PATH}")
 
+from torch.serialization import add_safe_globals
+from ultralytics.nn.tasks import DetectionModel
+
+# Allow YOLO DetectionModel class to be loaded safely
+add_safe_globals([DetectionModel])
+
+# load model safely
 model = YOLO(MODEL_PATH)
 print("Model loaded. Names:", model.names)
 
