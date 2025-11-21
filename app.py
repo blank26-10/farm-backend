@@ -14,11 +14,25 @@ import cv2
 from ultralytics import YOLO
 from threading import Lock
 
+# --- PyTorch safe-globals allowlisting (fixes PyTorch 2.6+ unpickling errors) ---
+import torch
+from torch.serialization import add_safe_globals
+# ultralytics internal class that may be stored in .pt files
+try:
+    from ultralytics.nn.tasks import DetectionModel
+    add_safe_globals([DetectionModel])
+except Exception:
+    # if import fails, we'll still attempt to add common torch classes below
+    pass
+
+# allowlist common torch container used inside many checkpoints
+add_safe_globals([torch.nn.modules.container.Sequential, torch.nn.modules.module.Module])
+
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],  # restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -26,31 +40,32 @@ app.add_middleware(
 
 # ---------- CONFIG ----------
 HERE = os.path.dirname(__file__)
-DEFAULT_WEIGHT = os.path.join(HERE, "yolov8n.pt")
-LOCAL_WEIGHT = os.path.join(HERE, "best.pt")
+DEFAULT_WEIGHT = os.path.join(HERE, "yolov8n.pt")  # fallback weight (will be downloaded by ultralytics if absent)
+LOCAL_WEIGHT = os.path.join(HERE, "best.pt")  # if you trained and placed a best.pt here
 
 MODEL_PATH = LOCAL_WEIGHT if os.path.exists(LOCAL_WEIGHT) else DEFAULT_WEIGHT
 print(f"Loading model from: {MODEL_PATH}")
 
-from torch.serialization import add_safe_globals
-from ultralytics.nn.tasks import DetectionModel
+# load model (wrapped to surface clear error if something else needs allowlisting)
+try:
+    model = YOLO(MODEL_PATH)  # will use CPU or GPU if available
+    print("Model loaded. Names:", model.names)
+except Exception as e:
+    # Re-raise with a helpful message for logs
+    print("Error loading YOLO model. If you see a torch UnpicklingError complaining about 'Unsupported global',")
+    print("you need to add that class to torch.serialization.add_safe_globals([...]) before creating the YOLO object.")
+    raise
 
-# Allow YOLO DetectionModel class to be loaded safely
-add_safe_globals([DetectionModel])
-
-# load model safely
-model = YOLO(MODEL_PATH)
-print("Model loaded. Names:", model.names)
-
-# ---------- SIMPLE TRACKER ----------
+# ---------- SIMPLE SERVER-SIDE TRACKER (IoU-based) ----------
 TRACK_IOU_THRESHOLD = 0.3
-TRACK_MAX_AGE = 2.5  
+TRACK_MAX_AGE = 2.5  # seconds
 
 tracker_lock = Lock()
-tracks = {}
+tracks = {}  # id -> {'bbox':[x1,y1,x2,y2], 'label':str, 'confidence':float, 'last_seen':ts}
 next_track_id = 1
 
-def now(): return time.time()
+def now():
+    return time.time()
 
 def iou_box(a, b):
     xa = max(a[0], b[0]); ya = max(a[1], b[1])
@@ -58,18 +73,19 @@ def iou_box(a, b):
     inter_w = max(0, xb - xa)
     inter_h = max(0, yb - ya)
     inter = inter_w * inter_h
-    if inter == 0: return 0.0
+    if inter == 0:
+        return 0.0
     area_a = (a[2]-a[0]) * (a[3]-a[1])
     area_b = (b[2]-b[0]) * (b[3]-b[1])
     return inter / (area_a + area_b - inter)
 
-def update_tracks(detections):
+def update_tracks(detections: List[Dict[str, Any]]):
     global next_track_id, tracks
     cur = now()
     results = []
 
     with tracker_lock:
-        unmatched = list(tracks.items())
+        unmatched_tracks = list(tracks.items())  # (id, trackdict)
         new_tracks = {}
 
         for det in detections:
@@ -78,10 +94,10 @@ def update_tracks(detections):
             conf = det['confidence']
 
             best_id = None
-            best_iou = 0
+            best_iou = 0.0
             best_idx = -1
 
-            for idx, (tid, t) in enumerate(unmatched):
+            for idx, (tid, t) in enumerate(unmatched_tracks):
                 if t['label'] != label:
                     continue
                 i = iou_box(bbox, t['bbox'])
@@ -91,11 +107,11 @@ def update_tracks(detections):
                     best_idx = idx
 
             if best_id is not None and best_iou >= TRACK_IOU_THRESHOLD:
-                item = unmatched.pop(best_idx)[1]
-                item['bbox'] = bbox
-                item['confidence'] = conf
-                item['last_seen'] = cur
-                new_tracks[best_id] = item
+                t = unmatched_tracks.pop(best_idx)[1]
+                t['bbox'] = bbox
+                t['confidence'] = conf
+                t['last_seen'] = cur
+                new_tracks[best_id] = t
             else:
                 tid = next_track_id
                 next_track_id += 1
@@ -106,7 +122,7 @@ def update_tracks(detections):
                     'last_seen': cur
                 }
 
-        for tid, t in unmatched:
+        for tid, t in unmatched_tracks:
             if cur - t['last_seen'] <= TRACK_MAX_AGE:
                 new_tracks[tid] = t
 
@@ -116,36 +132,50 @@ def update_tracks(detections):
             results.append({
                 'id': tid,
                 'label': t['label'],
-                'confidence': float(t['confidence']),
+                'confidence': float(t.get('confidence', 0)),
                 'bbox': [float(x) for x in t['bbox']]
             })
 
     return results
 
+# ---------- DETECTION UTIL ----------
+def pil_from_bytes(b: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(b)).convert("RGB")
 
-# ---------- UTIL ----------
-def pil_from_bytes(b): return Image.open(io.BytesIO(b)).convert("RGB")
-
-def image_bytes_to_cv2(b):
+def image_bytes_to_cv2(b: bytes):
     arr = np.frombuffer(b, np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img
 
-def parse_ultralytics_result(r):
+def parse_ultralytics_result(r) -> List[Dict[str,Any]]:
     dets = []
-    if r.boxes is None:
+    if getattr(r, 'boxes', None) is None:
         return dets
-    for box in r.boxes:
-        x1, y1, x2, y2 = box.xyxy.cpu().numpy().tolist()[0]
-        conf = float(box.conf)
-        cls = int(box.cls)
-        label = model.names.get(cls, str(cls))
-        dets.append({
-            'label': label,
-            'confidence': conf,
-            'bbox': [x1, y1, x2, y2]
-        })
+    # ultralytics r.boxes may provide tensors
+    try:
+        xyxy = r.boxes.xyxy.cpu().numpy()  # Nx4
+        confs = r.boxes.conf.cpu().numpy()
+        clss = r.boxes.cls.cpu().numpy().astype(int)
+        for box, c, cls in zip(xyxy, confs, clss):
+            label = model.names.get(int(cls), str(int(cls)))
+            dets.append({
+                'label': label,
+                'confidence': float(c),
+                'bbox': [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
+            })
+    except Exception:
+        # fallback: iterate r.boxes
+        for box in r.boxes:
+            xyxy = box.xyxy.cpu().numpy().tolist()[0]
+            conf = float(box.conf.cpu().numpy().tolist()[0])
+            cls = int(box.cls.cpu().numpy().tolist()[0])
+            label = model.names.get(cls, str(cls))
+            dets.append({
+                'label': label,
+                'confidence': conf,
+                'bbox': [xyxy[0], xyxy[1], xyxy[2], xyxy[3]]
+            })
     return dets
-
 
 # ---------- ENDPOINTS ----------
 @app.get("/status")
@@ -153,67 +183,54 @@ async def status():
     return {"ok": True, "model": MODEL_PATH, "names": model.names}
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...), conf: float = Query(0.15)):
+async def predict(file: UploadFile = File(...), conf: float = Query(0.25)):
     b = await file.read()
     img = image_bytes_to_cv2(b)
-    results = model.predict(source=img, conf=conf, verbose=False)[0]
-
-    dets = parse_ultralytics_result(results)
-    return {"predictions": dets}
-
+    results = model.predict(source=img, conf=conf, verbose=False)
+    r = results[0]
+    dets = parse_ultralytics_result(r)
+    return JSONResponse({"predictions": dets})
 
 @app.post("/annotated")
-async def annotated(file: UploadFile = File(...), conf: float = Query(0.15)):
+async def annotated(file: UploadFile = File(...), conf: float = Query(0.25)):
     b = await file.read()
     img_pil = pil_from_bytes(b)
     img_cv = image_bytes_to_cv2(b)
-
-    results = model.predict(source=img_cv, conf=conf, verbose=False)[0]
-    dets = parse_ultralytics_result(results)
+    results = model.predict(source=img_cv, conf=conf, verbose=False)
+    r = results[0]
+    dets = parse_ultralytics_result(r)
 
     draw = ImageDraw.Draw(img_pil)
-    font = ImageFont.load_default()
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
 
     for d in dets:
-        x1, y1, x2, y2 = d['bbox']
-        label = f"{d['label']} {d['confidence']:.1f}"
-        draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
+        x1,y1,x2,y2 = d['bbox']
+        label = f"{d['label']} {d['confidence']:.2f}"
+        draw.rectangle([x1,y1,x2,y2], outline="red", width=2)
         draw.text((x1, y1 - 10), label, fill="white", font=font)
 
     buf = io.BytesIO()
     img_pil.save(buf, format="JPEG")
-    b64 = base64.b64encode(buf.getvalue()).decode()
+    b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
 
     return {"image_base64": b64, "predictions": dets}
 
-
-# ---------- FIXED LIVE FRAME DETECTION ----------
 @app.post("/frame-detect")
-async def frame_detect(file: UploadFile = File(...), conf: float = Query(0.15)):
+async def frame_detect(file: UploadFile = File(...), conf: float = Query(0.25)):
     b = await file.read()
     img_cv = image_bytes_to_cv2(b)
-
-    # ---------------- FIX: Speed up real-time detection ----------------
-    h, w = img_cv.shape[:2]
-    scale = 0.5   # reduce frame size → faster YOLO
-    img_small = cv2.resize(img_cv, (int(w * scale), int(h * scale)))
-    # -------------------------------------------------------------------
-
-    results = model.predict(source=img_small, conf=conf, verbose=False)[0]
-    dets = parse_ultralytics_result(results)
-
-    # Re-scale detections back to original image size
-    for d in dets:
-        d['bbox'][0] /= scale
-        d['bbox'][1] /= scale
-        d['bbox'][2] /= scale
-        d['bbox'][3] /= scale
+    results = model.predict(source=img_cv, conf=conf, verbose=False)
+    r = results[0]
+    dets = parse_ultralytics_result(r)
 
     tracks_out = update_tracks(dets)
 
     return {"predictions": dets, "tracks": tracks_out}
 
+# OPTIONAL: video endpoints could be added here (video-annotated, video-detect) if needed
 
-# ---------- MAIN ----------
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
