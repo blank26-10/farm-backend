@@ -183,7 +183,7 @@ async def status():
     return {"ok": True, "model": MODEL_PATH, "names": model.names}
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...), conf: float = Query(0.25)):
+async def predict(file: UploadFile = File(...), conf: float = Query(0.05)):
     b = await file.read()
     img = image_bytes_to_cv2(b)
     results = model.predict(source=img, conf=conf, verbose=False)
@@ -192,7 +192,7 @@ async def predict(file: UploadFile = File(...), conf: float = Query(0.25)):
     return JSONResponse({"predictions": dets})
 
 @app.post("/annotated")
-async def annotated(file: UploadFile = File(...), conf: float = Query(0.25)):
+async def annotated(file: UploadFile = File(...), conf: float = Query(0.05)):
     b = await file.read()
     img_pil = pil_from_bytes(b)
     img_cv = image_bytes_to_cv2(b)
@@ -219,7 +219,7 @@ async def annotated(file: UploadFile = File(...), conf: float = Query(0.25)):
     return {"image_base64": b64, "predictions": dets}
 
 @app.post("/frame-detect")
-async def frame_detect(file: UploadFile = File(...), conf: float = Query(0.25)):
+async def frame_detect(file: UploadFile = File(...), conf: float = Query(0.05)):
     b = await file.read()
     img_cv = image_bytes_to_cv2(b)
     results = model.predict(source=img_cv, conf=conf, verbose=False)
