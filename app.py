@@ -272,7 +272,7 @@ async def classes():
     return {"allowed": sorted(list(ALLOWED_CLASSES)), "allowed_ids": sorted(list(ALLOWED_CLASS_IDS))}
 
 @app.post("/debug-raw")
-async def debug_raw(file: UploadFile = File(...), conf: float = Query(0.15)):
+async def debug_raw(file: UploadFile = File(...), conf: float = Query(0.3)):
     """
     Debug endpoint: returns raw detections (class ids + names + conf + bbox)
     Use this to inspect what the model predicts for a given image.
@@ -309,7 +309,7 @@ async def debug_raw(file: UploadFile = File(...), conf: float = Query(0.15)):
     return {"raw": raw, "model_names": model.names}
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...), conf: float = Query(0.15)):
+async def predict(file: UploadFile = File(...), conf: float = Query(0.3)):
     b = await file.read()
     if len(b) > MAX_UPLOAD_BYTES:
         return JSONResponse({"error": "payload too large"}, status_code=413)
@@ -322,7 +322,7 @@ async def predict(file: UploadFile = File(...), conf: float = Query(0.15)):
     return JSONResponse({"predictions": dets})
 
 @app.post("/annotated")
-async def annotated(file: UploadFile = File(...), conf: float = Query(0.15)):
+async def annotated(file: UploadFile = File(...), conf: float = Query(0.3)):
     b = await file.read()
     if len(b) > MAX_UPLOAD_BYTES:
         return JSONResponse({"error": "payload too large"}, status_code=413)
@@ -353,7 +353,7 @@ async def annotated(file: UploadFile = File(...), conf: float = Query(0.15)):
     return {"image_base64": b64, "predictions": dets}
 
 @app.post("/frame-detect")
-async def frame_detect(file: UploadFile = File(...), conf: float = Query(0.15)):
+async def frame_detect(file: UploadFile = File(...), conf: float = Query(0.3)):
     b = await file.read()
     if len(b) > MAX_UPLOAD_BYTES:
         return JSONResponse({"error": "payload too large"}, status_code=413)
