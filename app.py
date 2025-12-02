@@ -3,6 +3,7 @@ import os
 import io
 import time
 import base64
+import logging
 from typing import List, Dict, Any
 from fastapi import FastAPI, File, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,22 +18,26 @@ from threading import Lock
 # --- PyTorch safe-globals allowlisting (fixes PyTorch 2.6+ unpickling errors) ---
 import torch
 from torch.serialization import add_safe_globals
-# ultralytics internal class that may be stored in .pt files
+
 try:
     from ultralytics.nn.tasks import DetectionModel
     add_safe_globals([DetectionModel])
 except Exception:
-    # if import fails, we'll still attempt to add common torch classes below
     pass
 
-# allowlist common torch container used inside many checkpoints
 add_safe_globals([torch.nn.modules.container.Sequential, torch.nn.modules.module.Module])
 
-app = FastAPI()
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("farm-detector")
 
+# ---------- APP ----------
+app = FastAPI(title="Farm Animal Detector API", version="1.0")
+
+# NOTE: in production restrict origins to your frontend domain
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,28 +45,70 @@ app.add_middleware(
 
 # ---------- CONFIG ----------
 HERE = os.path.dirname(__file__)
-DEFAULT_WEIGHT = os.path.join(HERE, "yolov8n.pt")  # fallback weight (will be downloaded by ultralytics if absent)
-LOCAL_WEIGHT = os.path.join(HERE, "best.pt")  # if you trained and placed a best.pt here
+DEFAULT_WEIGHT = os.path.join(HERE, "yolov8n.pt")   # fallback, ultralytics will download if needed
+LOCAL_WEIGHT = os.path.join(HERE, "best.pt")       # put your trained farm-only model here if available
 
 MODEL_PATH = LOCAL_WEIGHT if os.path.exists(LOCAL_WEIGHT) else DEFAULT_WEIGHT
-print(f"Loading model from: {MODEL_PATH}")
+logger.info("[startup] Loading model from: %s", MODEL_PATH)
 
-# load model (wrapped to surface clear error if something else needs allowlisting)
+# ---------- Allowed classes (farm animals + human)
+# Edit this list to match the labels you want to allow in API responses.
+ALLOWED_CLASSES = {
+    "person", "cow", "cattle", "sheep", "goat", "pig", "horse", "chicken", "chick", "dog", "cat"
+}
+
+# alias map to normalize different label names -> canonical
+CLASS_ALIAS = {
+    "cattle": "cow",
+    "cows": "cow",
+    "sheeps": "sheep",
+    "chickens": "chicken",
+    "pigs": "pig",
+    "goats": "goat",
+    "horses": "horse",
+    "chicks": "chick",
+}
+
+def normalize_label(name: str) -> str:
+    if not name:
+        return name
+    n = name.strip().lower()
+    return CLASS_ALIAS.get(n, n)
+
+# ---------- Load model (raise helpful error if failing) ----------
 try:
-    model = YOLO(MODEL_PATH)  # will use CPU or GPU if available
-    print("Model loaded. Names:", model.names)
+    model = YOLO(MODEL_PATH)
+    logger.info("[startup] Model loaded. Names: %s", model.names)
 except Exception as e:
-    # Re-raise with a helpful message for logs
-    print("Error loading YOLO model. If you see a torch UnpicklingError complaining about 'Unsupported global',")
-    print("you need to add that class to torch.serialization.add_safe_globals([...]) before creating the YOLO object.")
+    logger.exception("[startup] Error loading YOLO model:")
     raise
 
-# ---------- SIMPLE SERVER-SIDE TRACKER (IoU-based) ----------
+# Build allowed class ID set from model.names to avoid string mismatches
+MODEL_NAMES = {int(k): v for k, v in getattr(model, "names", {}).items()} if getattr(model, "names", None) else {}
+ALLOWED_CLASS_IDS = set()
+missing_allowed = set()
+
+for allowed in ALLOWED_CLASSES:
+    # find any model class that normalizes to the allowed class
+    found_any = False
+    for cid, cname in MODEL_NAMES.items():
+        if normalize_label(cname) == normalize_label(allowed):
+            ALLOWED_CLASS_IDS.add(cid)
+            found_any = True
+    if not found_any:
+        missing_allowed.add(allowed)
+
+if missing_allowed:
+    logger.warning("Some allowed classes were not found in model.names: %s. Use /debug-raw to inspect model classes.", missing_allowed)
+
+logger.info("Allowed class ids: %s", sorted(list(ALLOWED_CLASS_IDS)))
+
+# ---------- Tracking utils (IoU-based simple tracker) ----------
 TRACK_IOU_THRESHOLD = 0.3
 TRACK_MAX_AGE = 2.5  # seconds
 
 tracker_lock = Lock()
-tracks = {}  # id -> {'bbox':[x1,y1,x2,y2], 'label':str, 'confidence':float, 'last_seen':ts}
+tracks = {}  # id -> {'bbox':..., 'label':..., 'confidence':..., 'last_seen':ts}
 next_track_id = 1
 
 def now():
@@ -122,6 +169,7 @@ def update_tracks(detections: List[Dict[str, Any]]):
                     'last_seen': cur
                 }
 
+        # keep recent unmatched tracks
         for tid, t in unmatched_tracks:
             if cur - t['last_seen'] <= TRACK_MAX_AGE:
                 new_tracks[tid] = t
@@ -138,7 +186,7 @@ def update_tracks(detections: List[Dict[str, Any]]):
 
     return results
 
-# ---------- DETECTION UTIL ----------
+# ---------- Image utilities ----------
 def pil_from_bytes(b: bytes) -> Image.Image:
     return Image.open(io.BytesIO(b)).convert("RGB")
 
@@ -147,17 +195,43 @@ def image_bytes_to_cv2(b: bytes):
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     return img
 
-def parse_ultralytics_result(r) -> List[Dict[str,Any]]:
+# ---------- Filtering & parsing ----------
+# Tuning knobs
+MIN_CONF = 0.25                  # Minimum confidence to accept detection (tune up if many false positives)
+MIN_BOX_AREA_PIXELS = 500       # ignore tiny boxes (pixels); tune to your input resolution
+MAX_UPLOAD_BYTES = 1024 * 1024 * 4  # 4 MB default limit (tune as needed)
+
+def parse_ultralytics_result_filtered_by_id(r) -> List[Dict[str,Any]]:
+    """
+    Return detections filtered by:
+      - class id in ALLOWED_CLASS_IDS
+      - confidence >= MIN_CONF
+      - box area >= MIN_BOX_AREA_PIXELS
+    """
     dets = []
     if getattr(r, 'boxes', None) is None:
         return dets
-    # ultralytics r.boxes may provide tensors
+
+    # vectorized path
     try:
         xyxy = r.boxes.xyxy.cpu().numpy()  # Nx4
         confs = r.boxes.conf.cpu().numpy()
         clss = r.boxes.cls.cpu().numpy().astype(int)
         for box, c, cls in zip(xyxy, confs, clss):
-            label = model.names.get(int(cls), str(int(cls)))
+            if float(c) < MIN_CONF:
+                logger.debug("Filtered by conf: id=%s conf=%.3f", int(cls), float(c))
+                continue
+            if int(cls) not in ALLOWED_CLASS_IDS:
+                logger.debug("Filtered by id: id=%s name=%s", int(cls), model.names.get(int(cls), str(int(cls))))
+                continue
+            # box area filter
+            w = float(box[2]) - float(box[0])
+            h = float(box[3]) - float(box[1])
+            if (w * h) < MIN_BOX_AREA_PIXELS:
+                logger.debug("Filtered by area: area=%.1f (w=%.1f h=%.1f)", (w*h), w, h)
+                continue
+            raw_label = model.names.get(int(cls), str(int(cls)))
+            label = normalize_label(raw_label)
             dets.append({
                 'label': label,
                 'confidence': float(c),
@@ -169,7 +243,16 @@ def parse_ultralytics_result(r) -> List[Dict[str,Any]]:
             xyxy = box.xyxy.cpu().numpy().tolist()[0]
             conf = float(box.conf.cpu().numpy().tolist()[0])
             cls = int(box.cls.cpu().numpy().tolist()[0])
-            label = model.names.get(cls, str(cls))
+            if conf < MIN_CONF:
+                continue
+            if cls not in ALLOWED_CLASS_IDS:
+                continue
+            w = float(xyxy[2]) - float(xyxy[0])
+            h = float(xyxy[3]) - float(xyxy[1])
+            if (w * h) < MIN_BOX_AREA_PIXELS:
+                continue
+            raw_label = model.names.get(cls, str(cls))
+            label = normalize_label(raw_label)
             dets.append({
                 'label': label,
                 'confidence': conf,
@@ -177,28 +260,79 @@ def parse_ultralytics_result(r) -> List[Dict[str,Any]]:
             })
     return dets
 
-# ---------- ENDPOINTS ----------
+# ---------- Endpoints ----------
 @app.get("/status")
 async def status():
-    return {"ok": True, "model": MODEL_PATH, "names": model.names}
+    names = [normalize_label(n) for n in model.names.values()] if getattr(model, "names", None) else []
+    return {"ok": True, "model_path": MODEL_PATH, "model_names": names, "allowed_classes": sorted(list(ALLOWED_CLASSES)), "allowed_class_ids": sorted(list(ALLOWED_CLASS_IDS))}
+
+@app.get("/classes")
+async def classes():
+    """Return the allowed class names (useful for frontend legend)."""
+    return {"allowed": sorted(list(ALLOWED_CLASSES)), "allowed_ids": sorted(list(ALLOWED_CLASS_IDS))}
+
+@app.post("/debug-raw")
+async def debug_raw(file: UploadFile = File(...), conf: float = Query(0.15)):
+    """
+    Debug endpoint: returns raw detections (class ids + names + conf + bbox)
+    Use this to inspect what the model predicts for a given image.
+    """
+    b = await file.read()
+    if len(b) > MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": "payload too large"}, status_code=413)
+    img_cv = image_bytes_to_cv2(b)
+    results = model.predict(source=img_cv, conf=conf, verbose=False)
+    r = results[0]
+    raw = []
+    try:
+        xyxy = r.boxes.xyxy.cpu().numpy()
+        confs = r.boxes.conf.cpu().numpy()
+        clss = r.boxes.cls.cpu().numpy().astype(int)
+        for box, c, cls in zip(xyxy, confs, clss):
+            raw.append({
+                "class_id": int(cls),
+                "class_name": model.names.get(int(cls), str(int(cls))),
+                "confidence": float(c),
+                "bbox": [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
+            })
+    except Exception:
+        for box in r.boxes:
+            xyxy = box.xyxy.cpu().numpy().tolist()[0]
+            conf = float(box.conf.cpu().numpy().tolist()[0])
+            cls = int(box.cls.cpu().numpy().tolist()[0])
+            raw.append({
+                "class_id": cls,
+                "class_name": model.names.get(cls, str(cls)),
+                "confidence": conf,
+                "bbox": xyxy
+            })
+    return {"raw": raw, "model_names": model.names}
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...), conf: float = Query(0.15)):
     b = await file.read()
+    if len(b) > MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": "payload too large"}, status_code=413)
+    # enforce minimum confidence server-side
+    conf = max(conf, MIN_CONF)
     img = image_bytes_to_cv2(b)
     results = model.predict(source=img, conf=conf, verbose=False)
     r = results[0]
-    dets = parse_ultralytics_result(r)
+    dets = parse_ultralytics_result_filtered_by_id(r)
     return JSONResponse({"predictions": dets})
 
 @app.post("/annotated")
 async def annotated(file: UploadFile = File(...), conf: float = Query(0.15)):
     b = await file.read()
+    if len(b) > MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": "payload too large"}, status_code=413)
+
+    conf = max(conf, MIN_CONF)
     img_pil = pil_from_bytes(b)
     img_cv = image_bytes_to_cv2(b)
     results = model.predict(source=img_cv, conf=conf, verbose=False)
     r = results[0]
-    dets = parse_ultralytics_result(r)
+    dets = parse_ultralytics_result_filtered_by_id(r)
 
     draw = ImageDraw.Draw(img_pil)
     try:
@@ -221,16 +355,24 @@ async def annotated(file: UploadFile = File(...), conf: float = Query(0.15)):
 @app.post("/frame-detect")
 async def frame_detect(file: UploadFile = File(...), conf: float = Query(0.15)):
     b = await file.read()
+    if len(b) > MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": "payload too large"}, status_code=413)
+
+    conf = max(conf, MIN_CONF)
     img_cv = image_bytes_to_cv2(b)
     results = model.predict(source=img_cv, conf=conf, verbose=False)
     r = results[0]
-    dets = parse_ultralytics_result(r)
+    dets = parse_ultralytics_result_filtered_by_id(r)
 
     tracks_out = update_tracks(dets)
 
     return {"predictions": dets, "tracks": tracks_out}
 
-# OPTIONAL: video endpoints could be added here (video-annotated, video-detect) if needed
+# Optional: health endpoint
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
+# ---------- Run (dev) ----------
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
